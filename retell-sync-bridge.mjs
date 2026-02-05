@@ -89,16 +89,67 @@ const server = http.createServer(async (req, res) => {
 
       const now = new Date();
       const header = `\n\n---\n[retell webhook] ${now.toISOString()}\n`;
-      const payload = JSON.stringify(body, null, 2);
 
-      // Best-effort transcript extraction (varies by Retell event type)
+      // Best-effort: identify event + call id fields (Retell varies by product/event type)
+      const eventType =
+        body.event ||
+        body.event_type ||
+        body.type ||
+        body.name ||
+        body?.data?.event ||
+        body?.data?.event_type ||
+        'unknown_event';
+
+      const callId =
+        body.call_id ||
+        body?.data?.call_id ||
+        body?.data?.call?.call_id ||
+        body?.call?.call_id ||
+        '';
+
+      // Transcript extraction:
+      // - sometimes a plain string
+      // - sometimes a list of utterances
+      // - sometimes nested under data
       let transcript = '';
-      const maybeTranscript = body.transcript || body.call_transcript || body?.data?.transcript || body?.data?.call_transcript;
-      if (typeof maybeTranscript === 'string') transcript = maybeTranscript;
+      const maybeTranscript =
+        body.transcript ||
+        body.call_transcript ||
+        body?.data?.transcript ||
+        body?.data?.call_transcript;
 
-      // User preference: store timestamp + transcript in memory (sensitive info allowed).
-      const safeTranscript = transcript || '(no transcript field on this event)';
-      const text = `${header}\nTranscript:\n${safeTranscript}\n`;
+      if (typeof maybeTranscript === 'string') {
+        transcript = maybeTranscript;
+      } else {
+        const turns =
+          body?.data?.transcript_object ||
+          body?.transcript_object ||
+          body?.data?.transcript?.utterances ||
+          body?.transcript?.utterances ||
+          body?.data?.messages ||
+          body?.messages;
+
+        if (Array.isArray(turns) && turns.length) {
+          transcript = turns
+            .map((t) => {
+              const role = t.role || t.speaker || t.participant || '';
+              const text = t.text || t.content || t.utterance || t.message || '';
+              const line = `${role ? role + ': ' : ''}${text}`.trim();
+              return line;
+            })
+            .filter(Boolean)
+            .join('\n');
+        }
+      }
+
+      const safeTranscript = transcript || '(no transcript on this event)';
+      const raw = JSON.stringify(body, null, 2);
+
+      const text =
+        `${header}` +
+        `Event: ${eventType}${callId ? `\nCall ID: ${callId}` : ''}\n\n` +
+        `Transcript:\n${safeTranscript}\n\n` +
+        `Raw:\n\n\`\`\`json\n${raw}\n\`\`\`\n`;
 
       appendToDailyMemory(text).catch((err) => console.error('failed_to_append_memory', err));
       return;
