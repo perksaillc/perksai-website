@@ -442,15 +442,19 @@ const server = http.createServer(async (req, res) => {
       void sendStatusNotification(`❌ Status (${wait?.status || 'unknown'})${runTag}: ${summary}`);
     }
 
+    const responseText =
+      assistantText ||
+      (wait?.status === 'timeout'
+        ? 'Working on that in the background. I’ll update you when it finishes.'
+        : 'Done.');
+
+    // Retell will pass the function response back into the LLM; some prompts/tools prefer a `message` field.
     return send(res, 200, {
       ok: true,
       runId,
       status: wait?.status || 'unknown',
-      text:
-        assistantText ||
-        (wait?.status === 'timeout'
-          ? 'Working on that in the background. What would you like to do next?'
-          : 'Done.'),
+      text: responseText,
+      message: responseText,
     });
 
   } catch (err) {
