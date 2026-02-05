@@ -116,7 +116,8 @@ const server = http.createServer(async (req, res) => {
         '';
 
       // If configured, only log events for the Iris agent.
-      if (RETELL_AGENT_ID && agentId && agentId !== RETELL_AGENT_ID) {
+      // If agent id is missing on an event, treat it as non-Iris and ignore.
+      if (RETELL_AGENT_ID && agentId !== RETELL_AGENT_ID) {
         return;
       }
 
