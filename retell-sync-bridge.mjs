@@ -15,6 +15,16 @@ if (!SHARED_SECRET) {
 
 const SESSION_KEY = process.env.CLAWDBOT_SESSION_KEY || 'agent:main:main';
 
+// --- Status notifications (Telegram) ---
+// Goal: when Retell triggers work in Clawdbot, mirror status updates to Telegram so the user
+// sees progress even if they're currently on a call.
+const STATUS_NOTIFY_ENABLED = process.env.STATUS_NOTIFY_ENABLED !== '0';
+const STATUS_NOTIFY_CHANNEL = (process.env.STATUS_NOTIFY_CHANNEL || 'telegram').toLowerCase();
+const STATUS_NOTIFY_TO = process.env.STATUS_NOTIFY_TO || ''; // optional override (e.g. telegram:123456)
+const STATUS_NOTIFY_MAX_CHARS = process.env.STATUS_NOTIFY_MAX_CHARS
+  ? Number(process.env.STATUS_NOTIFY_MAX_CHARS)
+  : 3500;
+
 const WORKSPACE_DIR = process.env.CLAWDBOT_WORKSPACE_DIR || process.cwd();
 const MEMORY_DIR = path.join(WORKSPACE_DIR, 'memory');
 
@@ -37,6 +47,93 @@ async function appendToDailyMemory(text) {
 const gw = new GatewayChatClient({});
 gw.start();
 await gw.waitForReady();
+
+let cachedNotifyTarget = null;
+let cachedNotifyTargetAtMs = 0;
+
+function clampText(text, maxChars) {
+  const s = String(text ?? '');
+  if (s.length <= maxChars) return s;
+  return s.slice(0, Math.max(0, maxChars - 1)) + '…';
+}
+
+function oneLine(s) {
+  return String(s ?? '')
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+function summarizeInstruction(message) {
+  const s = oneLine(message);
+  const stripped = s.replace(/^update system instructions\s*:\s*/i, '').trim();
+  return clampText(stripped || s, 160);
+}
+
+async function resolveNotifyTarget() {
+  if (!STATUS_NOTIFY_ENABLED) return null;
+
+  const now = Date.now();
+  if (cachedNotifyTarget && now - cachedNotifyTargetAtMs < 60_000) return cachedNotifyTarget;
+
+  if (STATUS_NOTIFY_TO.trim()) {
+    cachedNotifyTarget = {
+      channel: STATUS_NOTIFY_CHANNEL,
+      to: STATUS_NOTIFY_TO.trim(),
+      accountId: process.env.STATUS_NOTIFY_ACCOUNT_ID?.trim() || undefined,
+    };
+    cachedNotifyTargetAtMs = now;
+    return cachedNotifyTarget;
+  }
+
+  // Best-effort: use the session's last delivery target (usually the Telegram chat this session is bound to).
+  const listed = await gw.client.request('sessions.list', {
+    search: SESSION_KEY,
+    limit: 10,
+    includeGlobal: true,
+    includeUnknown: true,
+  });
+
+  const session = Array.isArray(listed?.sessions)
+    ? listed.sessions.find((s) => s?.key === SESSION_KEY)
+    : null;
+
+  const to = session?.lastTo || session?.deliveryContext?.to || session?.origin?.to || '';
+  const accountId = session?.lastAccountId || session?.deliveryContext?.accountId || session?.origin?.accountId;
+
+  if (!to) {
+    cachedNotifyTarget = null;
+    cachedNotifyTargetAtMs = now;
+    return null;
+  }
+
+  cachedNotifyTarget = {
+    channel: STATUS_NOTIFY_CHANNEL,
+    to,
+    accountId: typeof accountId === 'string' && accountId.trim() ? accountId.trim() : undefined,
+  };
+  cachedNotifyTargetAtMs = now;
+  return cachedNotifyTarget;
+}
+
+async function sendStatusNotification(text) {
+  try {
+    const target = await resolveNotifyTarget();
+    if (!target?.to) return;
+
+    await gw.client.request('send', {
+      channel: target.channel,
+      to: target.to,
+      accountId: target.accountId,
+      message: clampText(String(text ?? '').trim(), STATUS_NOTIFY_MAX_CHARS),
+      sessionKey: SESSION_KEY, // mirror into the transcript
+      idempotencyKey: randomUUID(),
+    });
+  } catch (err) {
+    // Never block Retell / never crash the bridge for notification failures.
+    console.error('status_notify_failed', err);
+  }
+}
 
 async function readJson(req) {
   const chunks = [];
@@ -194,10 +291,23 @@ const server = http.createServer(async (req, res) => {
       return send(res, 400, { ok: false, error: 'missing_message' });
     }
 
-    const deliver = args.deliver ?? false; // For sync tool calls, prefer returning text; Telegram delivery is handled separately.
+    const deliver = args.deliver ?? false; // Retell expects a fast tool response; Telegram status updates are handled here.
     const thinking = args.thinking || 'low';
 
     const idempotencyKey = randomUUID();
+    const summary = summarizeInstruction(message);
+
+    // Smart notification logic:
+    // - If the run takes > ~1.2s, send a "Working" message.
+    // - Always send a "Done" (or Error) message once we know the outcome.
+    // - If the run times out (still running), send an "In progress" + follow up asynchronously on completion.
+    let workingNotified = false;
+    const workingTimer = setTimeout(() => {
+      workingNotified = true;
+      void sendStatusNotification(`⏳ Working: ${summary}`);
+    }, 1200);
+
+    const startedAt = Date.now();
 
     // Kick off the agent.
     const agentAck = await gw.client.request('agent', {
@@ -219,13 +329,66 @@ const server = http.createServer(async (req, res) => {
       new Promise((resolve) => setTimeout(() => resolve({ runId, status: 'timeout' }), timeoutMs + 250)),
     ]);
 
+    clearTimeout(workingTimer);
+
     let assistantText = '';
     if (wait?.status === 'ok') {
       assistantText = await getLastAssistantText();
     }
 
     // Log tool usage to daily memory for continuity.
-    appendToDailyMemory(`\n\n---\n[retell tool] ${new Date().toISOString()}\nMessage:\n${message}\nStatus: ${wait?.status || 'unknown'}\nRunId: ${runId}\n`).catch(() => {});
+    appendToDailyMemory(
+      `\n\n---\n[retell tool] ${new Date().toISOString()}\nMessage:\n${message}\nStatus: ${wait?.status || 'unknown'}\nRunId: ${runId}\n`
+    ).catch(() => {});
+
+    // Telegram status notification (always send final status; working is delayed + optional).
+    const elapsedMs = Date.now() - startedAt;
+    if (wait?.status === 'ok') {
+      const body = assistantText ? `\n${assistantText}` : '';
+      const finalMsg = `✅ Done: ${summary}${body}`;
+      // If it finished very quickly, we likely never sent "Working". That’s fine—this is the smart/compact path.
+      if (!workingNotified && elapsedMs < 1200) {
+        void sendStatusNotification(finalMsg);
+      } else {
+        // In case the delayed timer never fired (race), ensure there's at least one working-ish update.
+        if (!workingNotified) void sendStatusNotification(`⏳ Working: ${summary}`);
+        void sendStatusNotification(finalMsg);
+      }
+    } else if (wait?.status === 'timeout') {
+      // Ensure user sees that it's still running.
+      if (!workingNotified) void sendStatusNotification(`⏳ Working: ${summary}`);
+      void sendStatusNotification(`🟡 In progress: ${summary} (I’ll ping you here when it’s finished.)`);
+
+      // Follow up asynchronously when the run completes.
+      void (async () => {
+        const maxMs = 30 * 60 * 1000; // 30 minutes
+        const pollTimeoutMs = 60_000;
+        const start = Date.now();
+        while (Date.now() - start < maxMs) {
+          try {
+            const w = await gw.client.request('agent.wait', { runId, timeoutMs: pollTimeoutMs });
+            if (w?.status === 'ok') {
+              const text = await getLastAssistantText();
+              const body = text ? `\n${text}` : '';
+              await sendStatusNotification(`✅ Done: ${summary}${body}`);
+              return;
+            }
+            if (w?.status && w.status !== 'timeout') {
+              await sendStatusNotification(`❌ Status: ${w.status} — ${summary}`);
+              return;
+            }
+          } catch (err) {
+            await sendStatusNotification(`❌ Error while tracking status: ${summary}`);
+            console.error('status_followup_failed', err);
+            return;
+          }
+        }
+        await sendStatusNotification(`⚠️ Still running after 30 minutes: ${summary}`);
+      })();
+    } else {
+      // Some other status (error/unknown)
+      void sendStatusNotification(`❌ Status: ${wait?.status || 'unknown'} — ${summary}`);
+    }
 
     return send(res, 200, {
       ok: true,

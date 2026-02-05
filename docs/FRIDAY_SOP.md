@@ -158,6 +158,18 @@ Routes:
 Security:
 - Requires shared secret token: `RETELL_SYNC_SECRET` (via query `token=` or header `x-retell-token`)
 
+Status notifications (Telegram):
+- For every `POST /retell/sync` run, the bridge mirrors **task status** to Telegram:
+  - **Working** (if it takes longer than ~1s)
+  - **In progress** (if the tool call times out but the run continues)
+  - **Done** / **Error** (when the run completes)
+- Default target is the session’s `lastTo` (from `sessions.list` for `CLAWDBOT_SESSION_KEY`).
+- Optional overrides:
+  - `STATUS_NOTIFY_ENABLED=0` → disable
+  - `STATUS_NOTIFY_CHANNEL=telegram` (default)
+  - `STATUS_NOTIFY_TO=telegram:<chatId>`
+  - `STATUS_NOTIFY_MAX_CHARS=3500`
+
 ### 7.2 retell-reverse-proxy
 File: `retell-reverse-proxy.mjs`
 
