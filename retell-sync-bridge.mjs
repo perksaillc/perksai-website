@@ -151,7 +151,22 @@ const server = http.createServer(async (req, res) => {
         `Transcript:\n${safeTranscript}\n\n` +
         `Raw:\n\n\`\`\`json\n${raw}\n\`\`\`\n`;
 
+      // 1) Always append to daily memory
       appendToDailyMemory(text).catch((err) => console.error('failed_to_append_memory', err));
+
+      // 2) Also store per-call artifacts (best effort) so transcripts are easy to find later.
+      // Only write if we have a call id.
+      if (callId) {
+        const callDir = path.join(MEMORY_DIR, 'retell-calls');
+        const base = path.join(callDir, callId);
+        fs.mkdir(callDir, { recursive: true })
+          .then(() => Promise.all([
+            fs.writeFile(`${base}.json`, raw, 'utf8'),
+            fs.writeFile(`${base}.transcript.txt`, safeTranscript + '\n', 'utf8'),
+          ]))
+          .catch(() => {});
+      }
+
       return;
     }
 
