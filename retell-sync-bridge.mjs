@@ -183,6 +183,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method !== 'POST') return send(res, 405, { ok: false, error: 'method_not_allowed' });
 
     const url = new URL(req.url, `http://${req.headers.host}`);
+    const pathname = url.pathname.replace(/\/+$/, '') || '/';
 
     const token = req.headers['x-retell-token'] || url.searchParams.get('token');
     if (token !== SHARED_SECRET) return send(res, 401, { ok: false, error: 'unauthorized' });
@@ -191,7 +192,7 @@ const server = http.createServer(async (req, res) => {
     if (!body) return send(res, 400, { ok: false, error: 'invalid_json' });
 
     // 1) Retell voice call → webhook logging (Persona/Retell events, transcripts, etc)
-    if (url.pathname === '/retell/webhook') {
+    if (pathname === '/retell/webhook') {
       // Don’t block Retell on heavy work.
       send(res, 200, { ok: true });
 
@@ -322,7 +323,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     // 2) Retell custom function → Clawdbot agent execution
-    if (url.pathname !== '/retell/sync') return send(res, 404, { ok: false, error: 'not_found' });
+    if (pathname !== '/retell/sync') return send(res, 404, { ok: false, error: 'not_found' });
 
     // Retell custom function payload conventions: either args-only or wrapped.
     const args = body.args ?? body;
