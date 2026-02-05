@@ -6,6 +6,7 @@ import { GatewayChatClient } from '/opt/homebrew/lib/node_modules/clawdbot/dist/
 
 const PORT = process.env.RETELL_SYNC_PORT ? Number(process.env.RETELL_SYNC_PORT) : 3335;
 const SHARED_SECRET = process.env.RETELL_SYNC_SECRET;
+const RETELL_AGENT_ID = process.env.RETELL_AGENT_ID || null; // if set, only log webhook events for this agent
 
 if (!SHARED_SECRET) {
   console.error('Missing RETELL_SYNC_SECRET env var');
@@ -90,7 +91,7 @@ const server = http.createServer(async (req, res) => {
       const now = new Date();
       const header = `\n\n---\n[retell webhook] ${now.toISOString()}\n`;
 
-      // Best-effort: identify event + call id fields (Retell varies by product/event type)
+      // Best-effort: identify event + call id + agent id fields (Retell varies by product/event type)
       const eventType =
         body.event ||
         body.event_type ||
@@ -106,6 +107,18 @@ const server = http.createServer(async (req, res) => {
         body?.data?.call?.call_id ||
         body?.call?.call_id ||
         '';
+
+      const agentId =
+        body.agent_id ||
+        body?.call?.agent_id ||
+        body?.data?.agent_id ||
+        body?.data?.call?.agent_id ||
+        '';
+
+      // If configured, only log events for the Iris agent.
+      if (RETELL_AGENT_ID && agentId && agentId !== RETELL_AGENT_ID) {
+        return;
+      }
 
       // Transcript extraction:
       // - sometimes a plain string

@@ -5,11 +5,17 @@ const API_KEY = process.env.RETELL_API_KEY;
 const WORKSPACE_DIR = process.env.CLAWDBOT_WORKSPACE_DIR || process.cwd();
 const MEMORY_DIR = path.join(WORKSPACE_DIR, 'memory');
 
-// Optional: scope backfill to a single agent
+// Required by default: scope backfill to a single agent (avoid importing other agents' calls)
 const AGENT_ID = process.env.RETELL_AGENT_ID || null;
+const ALLOW_ALL = process.env.RETELL_ALLOW_ALL === 'true';
 
 if (!API_KEY) {
   console.error('Missing RETELL_API_KEY in env. Add it to .env.retell (gitignored).');
+  process.exit(1);
+}
+
+if (!AGENT_ID && !ALLOW_ALL) {
+  console.error('Missing RETELL_AGENT_ID. Refusing to backfill across ALL agents. Set RETELL_AGENT_ID, or set RETELL_ALLOW_ALL=true if you really want everything.');
   process.exit(1);
 }
 
