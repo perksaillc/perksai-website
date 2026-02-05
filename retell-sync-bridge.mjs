@@ -228,10 +228,13 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
+      const eventTypeNorm = String(eventType || '').toLowerCase();
+      const isCallStartedEvent = eventTypeNorm.includes('call_started');
+      const isCallEndedEvent = eventTypeNorm.includes('call_ended');
+
       // Call lifecycle (notify in Telegram + track whether we're currently on a call)
       try {
-        const t = String(eventType || '').toLowerCase();
-        if (t.includes('call_started')) {
+        if (isCallStartedEvent) {
           callOngoing = true;
           activeCallId = String(callId || '');
           lastCallStartedAtMs = Date.now();
@@ -239,15 +242,12 @@ const server = http.createServer(async (req, res) => {
             `📞 Call started${activeCallId ? ` (${activeCallId})` : ''}. I’ll post task status updates in this chat.`
           );
         }
-        if (t.includes('call_ended')) {
+        if (isCallEndedEvent) {
           // Mark ended if it's the active call, otherwise just best-effort.
           if (!activeCallId || String(callId || '') === activeCallId) {
             callOngoing = false;
             activeCallId = '';
           }
-          void sendStatusNotification(
-            `📞 Call ended${callId ? ` (${callId})` : ''}. Transcript/log saved.`
-          );
         }
       } catch {}
 
@@ -288,6 +288,13 @@ const server = http.createServer(async (req, res) => {
 
       const safeTranscript = transcript || '(no transcript on this event)';
       const raw = JSON.stringify(body, null, 2);
+
+      // On call end, push the transcript into Telegram (truncated) so it always lands in chat.
+      if (isCallEndedEvent) {
+        const head = `📞 Call ended${callId ? ` (${callId})` : ''}. Transcript (truncated):`;
+        const clip = clampText(safeTranscript, Math.min(STATUS_NOTIFY_MAX_CHARS, 3500));
+        void sendStatusNotification(`${head}\n${clip}`);
+      }
 
       const text =
         `${header}` +
