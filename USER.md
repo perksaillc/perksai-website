@@ -7,6 +7,7 @@
 - **Pronouns:** *(optional)*
 - **Timezone:** America/New_York
 - **Notes:** When they say “call me”, the intent is: trigger an outbound call from the Friday/Retell setup (not a Telegram call). Also: proactively open Clawdbot browser and log into dashboards when needed (ask for credentials/2FA handoff as required). For any web task, use the Clawdbot-managed browser. User may ask you to work in Google (Gmail/Calendar/Docs) under **gioalers@gmail.com** or **giovannie@moveo.net**.
+- **macOS permissions:** If Contacts / Messages access appears blocked or tool calls hang/fail, prompt the user to click **Allow** on any macOS permission dialog. If no dialog appears, ask them to enable permissions in **System Settings → Privacy & Security → Contacts / Automation / Full Disk Access** and retry.
 
 ## Context
 
