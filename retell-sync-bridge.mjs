@@ -51,6 +51,11 @@ await gw.waitForReady();
 let cachedNotifyTarget = null;
 let cachedNotifyTargetAtMs = 0;
 
+// Retell call lifecycle (best-effort) so we can be more aggressive with status updates while on a call.
+let activeCallId = '';
+let callOngoing = false;
+let lastCallStartedAtMs = 0;
+
 function clampText(text, maxChars) {
   const s = String(text ?? '');
   if (s.length <= maxChars) return s;
@@ -68,6 +73,11 @@ function summarizeInstruction(message) {
   const s = oneLine(message);
   const stripped = s.replace(/^update system instructions\s*:\s*/i, '').trim();
   return clampText(stripped || s, 160);
+}
+
+function shortRun(runId) {
+  const s = String(runId ?? '').trim();
+  return s.length > 10 ? s.slice(0, 8) : s;
 }
 
 async function resolveNotifyTarget() {
@@ -218,6 +228,29 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
+      // Call lifecycle (notify in Telegram + track whether we're currently on a call)
+      try {
+        const t = String(eventType || '').toLowerCase();
+        if (t.includes('call_started')) {
+          callOngoing = true;
+          activeCallId = String(callId || '');
+          lastCallStartedAtMs = Date.now();
+          void sendStatusNotification(
+            `📞 Call started${activeCallId ? ` (${activeCallId})` : ''}. I’ll post task status updates in this chat.`
+          );
+        }
+        if (t.includes('call_ended')) {
+          // Mark ended if it's the active call, otherwise just best-effort.
+          if (!activeCallId || String(callId || '') === activeCallId) {
+            callOngoing = false;
+            activeCallId = '';
+          }
+          void sendStatusNotification(
+            `📞 Call ended${callId ? ` (${callId})` : ''}. Transcript/log saved.`
+          );
+        }
+      } catch {}
+
       // Transcript extraction:
       // - sometimes a plain string
       // - sometimes a list of utterances
@@ -298,14 +331,12 @@ const server = http.createServer(async (req, res) => {
     const summary = summarizeInstruction(message);
 
     // Smart notification logic:
-    // - If the run takes > ~1.2s, send a "Working" message.
-    // - Always send a "Done" (or Error) message once we know the outcome.
-    // - If the run times out (still running), send an "In progress" + follow up asynchronously on completion.
+    // - While you're ON a call: send "Working" immediately.
+    // - Off-call: only send "Working" if it takes longer than ~1.2s (avoid spam).
+    // - Always send a final "Done" / "Error".
+    // - If the tool call times out (run continues), post "In progress" and follow up on completion.
     let workingNotified = false;
-    const workingTimer = setTimeout(() => {
-      workingNotified = true;
-      void sendStatusNotification(`⏳ Working: ${summary}`);
-    }, 1200);
+    let workingTimer = null;
 
     const startedAt = Date.now();
 
@@ -319,6 +350,17 @@ const server = http.createServer(async (req, res) => {
     });
 
     const runId = agentAck?.runId || idempotencyKey;
+    const runTag = runId ? ` (#${shortRun(runId)})` : '';
+
+    if (callOngoing) {
+      workingNotified = true;
+      void sendStatusNotification(`⏳ Working${runTag}: ${summary}`);
+    } else {
+      workingTimer = setTimeout(() => {
+        workingNotified = true;
+        void sendStatusNotification(`⏳ Working${runTag}: ${summary}`);
+      }, 1200);
+    }
 
     // Wait for completion (cap to keep voice UX snappy).
     // Retell tool calls should return quickly; long-running work can complete asynchronously.
@@ -329,7 +371,7 @@ const server = http.createServer(async (req, res) => {
       new Promise((resolve) => setTimeout(() => resolve({ runId, status: 'timeout' }), timeoutMs + 250)),
     ]);
 
-    clearTimeout(workingTimer);
+    if (workingTimer) clearTimeout(workingTimer);
 
     let assistantText = '';
     if (wait?.status === 'ok') {
@@ -341,23 +383,25 @@ const server = http.createServer(async (req, res) => {
       `\n\n---\n[retell tool] ${new Date().toISOString()}\nMessage:\n${message}\nStatus: ${wait?.status || 'unknown'}\nRunId: ${runId}\n`
     ).catch(() => {});
 
-    // Telegram status notification (always send final status; working is delayed + optional).
+    // Telegram status notification
     const elapsedMs = Date.now() - startedAt;
     if (wait?.status === 'ok') {
       const body = assistantText ? `\n${assistantText}` : '';
-      const finalMsg = `✅ Done: ${summary}${body}`;
-      // If it finished very quickly, we likely never sent "Working". That’s fine—this is the smart/compact path.
+      const finalMsg = `✅ Done${runTag}: ${summary}${body}`;
+      // If it finished very quickly (and we were off-call), we likely never sent "Working". That’s fine.
       if (!workingNotified && elapsedMs < 1200) {
         void sendStatusNotification(finalMsg);
       } else {
         // In case the delayed timer never fired (race), ensure there's at least one working-ish update.
-        if (!workingNotified) void sendStatusNotification(`⏳ Working: ${summary}`);
+        if (!workingNotified) void sendStatusNotification(`⏳ Working${runTag}: ${summary}`);
         void sendStatusNotification(finalMsg);
       }
     } else if (wait?.status === 'timeout') {
       // Ensure user sees that it's still running.
-      if (!workingNotified) void sendStatusNotification(`⏳ Working: ${summary}`);
-      void sendStatusNotification(`🟡 In progress: ${summary} (I’ll ping you here when it’s finished.)`);
+      if (!workingNotified) void sendStatusNotification(`⏳ Working${runTag}: ${summary}`);
+      void sendStatusNotification(
+        `🟡 In progress${runTag}: ${summary} (I’ll ping you here when it’s finished.)`
+      );
 
       // Follow up asynchronously when the run completes.
       void (async () => {
@@ -370,24 +414,24 @@ const server = http.createServer(async (req, res) => {
             if (w?.status === 'ok') {
               const text = await getLastAssistantText();
               const body = text ? `\n${text}` : '';
-              await sendStatusNotification(`✅ Done: ${summary}${body}`);
+              await sendStatusNotification(`✅ Done${runTag}: ${summary}${body}`);
               return;
             }
             if (w?.status && w.status !== 'timeout') {
-              await sendStatusNotification(`❌ Status: ${w.status} — ${summary}`);
+              await sendStatusNotification(`❌ Status (${w.status})${runTag}: ${summary}`);
               return;
             }
           } catch (err) {
-            await sendStatusNotification(`❌ Error while tracking status: ${summary}`);
+            await sendStatusNotification(`❌ Error while tracking status${runTag}: ${summary}`);
             console.error('status_followup_failed', err);
             return;
           }
         }
-        await sendStatusNotification(`⚠️ Still running after 30 minutes: ${summary}`);
+        await sendStatusNotification(`⚠️ Still running after 30 minutes${runTag}: ${summary}`);
       })();
     } else {
       // Some other status (error/unknown)
-      void sendStatusNotification(`❌ Status: ${wait?.status || 'unknown'} — ${summary}`);
+      void sendStatusNotification(`❌ Status (${wait?.status || 'unknown'})${runTag}: ${summary}`);
     }
 
     return send(res, 200, {

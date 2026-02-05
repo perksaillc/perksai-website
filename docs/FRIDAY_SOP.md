@@ -160,9 +160,12 @@ Security:
 
 Status notifications (Telegram):
 - For every `POST /retell/sync` run, the bridge mirrors **task status** to Telegram:
-  - **Working** (if it takes longer than ~1s)
+  - **Working** (immediately while a call is ongoing; otherwise only if it takes > ~1s)
   - **In progress** (if the tool call times out but the run continues)
   - **Done** / **Error** (when the run completes)
+- For `POST /retell/webhook` call lifecycle events, the bridge also posts:
+  - **Call started** (so you know the bridge is live)
+  - **Call ended** (confirming transcript/log was saved)
 - Default target is the session’s `lastTo` (from `sessions.list` for `CLAWDBOT_SESSION_KEY`).
 - Optional overrides:
   - `STATUS_NOTIFY_ENABLED=0` → disable
