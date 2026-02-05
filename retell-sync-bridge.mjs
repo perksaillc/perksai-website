@@ -372,7 +372,9 @@ const server = http.createServer(async (req, res) => {
 
     // Wait for completion (cap to keep voice UX snappy).
     // Retell tool calls should return quickly; long-running work can complete asynchronously.
-    const timeoutMs = Math.min(12_000, Math.max(1_000, Number(args.timeoutMs || 8_000)));
+    // Wait long enough that Retell can usually speak a real result, but cap to keep the voice UX snappy.
+    // (Retell's own tool timeout is typically much higher; this cap is our server-side guardrail.)
+    const timeoutMs = Math.min(25_000, Math.max(1_000, Number(args.timeoutMs || 12_000)));
 
     const wait = await Promise.race([
       gw.client.request('agent.wait', { runId, timeoutMs }),
@@ -445,7 +447,7 @@ const server = http.createServer(async (req, res) => {
     const responseText =
       assistantText ||
       (wait?.status === 'timeout'
-        ? 'Working on that in the background. I’ll update you when it finishes.'
+        ? `Still working (run ${shortRun(runId)}). I’ll post progress in Telegram; ask me “check status” if you want the final result read out loud.`
         : 'Done.');
 
     // Retell will pass the function response back into the LLM; some prompts/tools prefer a `message` field.
