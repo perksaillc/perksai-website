@@ -126,19 +126,62 @@ async function resolveNotifyTarget() {
   return cachedNotifyTarget;
 }
 
+function chunkText(text, maxChars) {
+  const s = String(text ?? '').trim();
+  if (!s) return [];
+  if (s.length <= maxChars) return [s];
+
+  // Try to split on paragraph boundaries first, then lines, then hard-split.
+  const chunks = [];
+  let remaining = s;
+
+  while (remaining.length > maxChars) {
+    // Prefer splitting at a boundary within the window.
+    const window = remaining.slice(0, maxChars + 1);
+
+    const paragraphIdx = window.lastIndexOf('\n\n');
+    const lineIdx = window.lastIndexOf('\n');
+    const spaceIdx = window.lastIndexOf(' ');
+
+    let cut = -1;
+    if (paragraphIdx > maxChars * 0.5) cut = paragraphIdx + 2;
+    else if (lineIdx > maxChars * 0.6) cut = lineIdx + 1;
+    else if (spaceIdx > maxChars * 0.8) cut = spaceIdx + 1;
+    else cut = maxChars;
+
+    const part = remaining.slice(0, cut).trimEnd();
+    if (part) chunks.push(part);
+    remaining = remaining.slice(cut).trimStart();
+  }
+
+  if (remaining) chunks.push(remaining);
+  return chunks;
+}
+
 async function sendStatusNotification(text) {
   try {
     const target = await resolveNotifyTarget();
     if (!target?.to) return;
 
-    await gw.client.request('send', {
-      channel: target.channel,
-      to: target.to,
-      accountId: target.accountId,
-      message: clampText(String(text ?? '').trim(), STATUS_NOTIFY_MAX_CHARS),
-      sessionKey: SESSION_KEY, // mirror into the transcript
-      idempotencyKey: randomUUID(),
-    });
+    const raw = String(text ?? '').trim();
+    if (!raw) return;
+
+    // If the message is too long, chunk it and annotate parts.
+    const parts = chunkText(raw, STATUS_NOTIFY_MAX_CHARS);
+    const n = parts.length;
+
+    for (let i = 0; i < n; i++) {
+      const prefix = n > 1 ? `(${i + 1}/${n}) ` : '';
+      const payload = clampText(prefix + parts[i], STATUS_NOTIFY_MAX_CHARS);
+      await gw.client.request('send', {
+        channel: target.channel,
+        to: target.to,
+        accountId: target.accountId,
+        message: payload,
+        sessionKey: SESSION_KEY, // mirror into the transcript
+        idempotencyKey: randomUUID(),
+      });
+    }
   } catch (err) {
     // Never block Retell / never crash the bridge for notification failures.
     console.error('status_notify_failed', err);
@@ -161,20 +204,75 @@ function send(res, status, obj) {
   res.end(body);
 }
 
-async function getLastAssistantText() {
-  const hist = await gw.loadHistory({ sessionKey: SESSION_KEY, limit: 10 });
+function coerceTimestampToMs(ts) {
+  if (!ts) return null;
+  if (typeof ts === 'number' && Number.isFinite(ts)) {
+    // Heuristic: seconds vs ms.
+    return ts < 1e12 ? ts * 1000 : ts;
+  }
+  if (typeof ts === 'string') {
+    const n = Number(ts);
+    if (Number.isFinite(n)) return n < 1e12 ? n * 1000 : n;
+    const d = Date.parse(ts);
+    return Number.isFinite(d) ? d : null;
+  }
+  return null;
+}
+
+function extractText(value) {
+  if (!value) return '';
+  if (typeof value === 'string') return value;
+
+  // Common "content" formats in Clawdbot/OpenAI Responses style:
+  // - [{type:"text", text:"..."}, {type:"toolCall", ...}]
+  // - [{type:"output_text", text:"..."}, ...]
+  if (Array.isArray(value)) {
+    const parts = value
+      .map((v) => {
+        if (!v) return '';
+        if (typeof v === 'string') return v;
+        if (typeof v === 'object') {
+          if (typeof v.text === 'string') return v.text;
+          if (typeof v.content === 'string') return v.content;
+          if (Array.isArray(v.content)) return extractText(v.content);
+        }
+        return '';
+      })
+      .filter(Boolean);
+    return parts.join('');
+  }
+
+  if (typeof value === 'object') {
+    if (typeof value.text === 'string') return value.text;
+    if (typeof value.message === 'string') return value.message;
+    if (typeof value.content === 'string') return value.content;
+    if (Array.isArray(value.content)) return extractText(value.content);
+  }
+
+  return '';
+}
+
+async function getLastAssistantText({ sinceMs } = {}) {
+  const hist = await gw.loadHistory({ sessionKey: SESSION_KEY, limit: 50 });
   const messages = hist?.messages || hist?.history || hist || [];
-  // Walk backwards for assistant text.
+
+  // Walk backwards for assistant text, optionally constrained by time.
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
     if (!m) continue;
+
     const role = m.role || m.kind;
-    if (role === 'assistant') {
-      const text = m.text ?? m.content ?? m.message ?? '';
-      if (typeof text === 'string' && text.trim()) return text.trim();
-      if (Array.isArray(text)) return text.map(x => (typeof x === 'string' ? x : '')).join('').trim();
+    if (role !== 'assistant') continue;
+
+    if (sinceMs) {
+      const t = coerceTimestampToMs(m.timestamp || m.time || m.createdAt);
+      if (t && t < sinceMs - 2000) continue;
     }
+
+    const text = extractText(m.text ?? m.content ?? m.message ?? m);
+    if (typeof text === 'string' && text.trim()) return text.trim();
   }
+
   return '';
 }
 
@@ -385,7 +483,7 @@ const server = http.createServer(async (req, res) => {
 
     let assistantText = '';
     if (wait?.status === 'ok') {
-      assistantText = await getLastAssistantText();
+      assistantText = await getLastAssistantText({ sinceMs: startedAt });
     }
 
     // Log tool usage to daily memory for continuity.
@@ -422,7 +520,7 @@ const server = http.createServer(async (req, res) => {
           try {
             const w = await gw.client.request('agent.wait', { runId, timeoutMs: pollTimeoutMs });
             if (w?.status === 'ok') {
-              const text = await getLastAssistantText();
+              const text = await getLastAssistantText({ sinceMs: startedAt });
               const body = text ? `\n${text}` : '';
               await sendStatusNotification(`✅ Done${runTag}: ${summary}${body}`);
               return;
