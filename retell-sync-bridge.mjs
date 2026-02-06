@@ -28,6 +28,9 @@ const STATUS_NOTIFY_MAX_CHARS = process.env.STATUS_NOTIFY_MAX_CHARS
 const WORKSPACE_DIR = process.env.CLAWDBOT_WORKSPACE_DIR || process.cwd();
 const MEMORY_DIR = path.join(WORKSPACE_DIR, 'memory');
 
+// Persist a tiny bit of state so "check status" can work without spawning a new agent run.
+const STATE_FILE = path.join(WORKSPACE_DIR, 'data', 'retell-sync-state.json');
+
 function nyDateStamp(d = new Date()) {
   return new Intl.DateTimeFormat('en-CA', {
     timeZone: 'America/New_York',
@@ -42,6 +45,81 @@ async function appendToDailyMemory(text) {
   const file = path.join(MEMORY_DIR, `${stamp}.md`);
   await fs.mkdir(MEMORY_DIR, { recursive: true });
   await fs.appendFile(file, text, 'utf8');
+}
+
+async function readState() {
+  try {
+    await fs.mkdir(path.dirname(STATE_FILE), { recursive: true });
+    const raw = await fs.readFile(STATE_FILE, 'utf8');
+    const json = JSON.parse(raw);
+    if (!json || typeof json !== 'object') return { runs: [] };
+    if (!Array.isArray(json.runs)) json.runs = [];
+    return json;
+  } catch {
+    return { runs: [] };
+  }
+}
+
+async function writeState(next) {
+  try {
+    await fs.mkdir(path.dirname(STATE_FILE), { recursive: true });
+    await fs.writeFile(STATE_FILE, JSON.stringify(next, null, 2) + '\n', 'utf8');
+  } catch (err) {
+    // Never crash for state write errors.
+    console.error('state_write_failed', err);
+  }
+}
+
+async function recordRunStart({ runId, summary, message, startedAtMs }) {
+  const state = await readState();
+  const now = Date.now();
+  const item = {
+    runId,
+    summary,
+    message: clampText(oneLine(message), 500),
+    startedAtMs: startedAtMs || now,
+    updatedAtMs: now,
+    status: 'running',
+  };
+  state.runs = [item, ...state.runs.filter((r) => r?.runId && r.runId !== runId)].slice(0, 50);
+  await writeState(state);
+}
+
+async function recordRunUpdate({ runId, patch }) {
+  const state = await readState();
+  let found = false;
+  state.runs = (state.runs || []).map((r) => {
+    if (r?.runId !== runId) return r;
+    found = true;
+    return { ...r, ...patch, updatedAtMs: Date.now() };
+  });
+  if (!found) {
+    state.runs = [{ runId, updatedAtMs: Date.now(), ...(patch || {}) }, ...(state.runs || [])].slice(0, 50);
+  }
+  await writeState(state);
+}
+
+function extractRunIdFromText(s) {
+  const text = String(s || '');
+  // Accept full UUIDs, or a short 8-char run like "#a1b2c3d4".
+  const uuid = text.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+  if (uuid) return uuid[0];
+  const short = text.match(/#([0-9a-f]{8})\b/i);
+  if (short) return short[1];
+  return '';
+}
+
+function isStatusQuery(message) {
+  const s = oneLine(message).toLowerCase();
+  return (
+    s === 'check status' ||
+    s.startsWith('check status ') ||
+    s === 'status' ||
+    s.startsWith('status ') ||
+    s.startsWith('job status') ||
+    s.includes('status update') ||
+    s.includes('are you done')
+  );
 }
 
 const gw = new GatewayChatClient({});
@@ -430,6 +508,61 @@ const server = http.createServer(async (req, res) => {
       return send(res, 400, { ok: false, error: 'missing_message' });
     }
 
+    // Special case: "check status" should NOT spawn a new agent run.
+    if (isStatusQuery(message)) {
+      const state = await readState();
+      const wantRun = extractRunIdFromText(message);
+
+      let item = null;
+      if (wantRun) {
+        item = (state.runs || []).find((r) => r?.runId === wantRun || shortRun(r?.runId) === wantRun);
+      }
+      if (!item) {
+        // Prefer the newest running job; otherwise the newest job.
+        item = (state.runs || []).find((r) => r?.status === 'running') || (state.runs || [])[0] || null;
+      }
+
+      if (!item?.runId) {
+        return send(res, 200, {
+          ok: true,
+          status: 'no_jobs',
+          message: 'No active jobs to report.',
+          text: 'No active jobs to report.',
+        });
+      }
+
+      // Quick poll: if it completed, grab the latest assistant output.
+      let polled = null;
+      try {
+        polled = await gw.client.request('agent.wait', { runId: item.runId, timeoutMs: 1000 });
+      } catch {
+        polled = null;
+      }
+
+      const isDone = polled?.status === 'ok' || item.status === 'done';
+      const status = isDone ? 'done' : (item.status || polled?.status || 'running');
+      const runTag = item.runId ? ` (#${shortRun(item.runId)})` : '';
+
+      let bodyText = '';
+      if (isDone) {
+        const t = await getLastAssistantText({ sinceMs: item.startedAtMs });
+        bodyText = t ? `\n${t}` : '';
+        await recordRunUpdate({
+          runId: item.runId,
+          patch: { status: 'done', completedAtMs: Date.now() },
+        });
+      }
+
+      const responseText = `Status${runTag}: ${status}. ${item.summary || summarizeInstruction(item.message || '')}`.trim() + bodyText;
+      return send(res, 200, {
+        ok: true,
+        runId: item.runId,
+        status,
+        message: responseText,
+        text: responseText,
+      });
+    }
+
     const deliver = args.deliver ?? false; // Retell expects a fast tool response; Telegram status updates are handled here.
     const thinking = args.thinking || 'low';
 
@@ -458,6 +591,9 @@ const server = http.createServer(async (req, res) => {
     const runId = agentAck?.runId || idempotencyKey;
     const runTag = runId ? ` (#${shortRun(runId)})` : '';
 
+    // Record run so later "check status" can report it without spawning a new job.
+    await recordRunStart({ runId, summary, message, startedAtMs: startedAt });
+
     if (callOngoing) {
       workingNotified = true;
       void sendStatusNotification(`⏳ Working${runTag}: ${summary}`);
@@ -484,6 +620,7 @@ const server = http.createServer(async (req, res) => {
     let assistantText = '';
     if (wait?.status === 'ok') {
       assistantText = await getLastAssistantText({ sinceMs: startedAt });
+      void recordRunUpdate({ runId, patch: { status: 'done', completedAtMs: Date.now() } });
     }
 
     // Log tool usage to daily memory for continuity.
@@ -506,6 +643,7 @@ const server = http.createServer(async (req, res) => {
       }
     } else if (wait?.status === 'timeout') {
       // Ensure user sees that it's still running.
+      void recordRunUpdate({ runId, patch: { status: 'running' } });
       if (!workingNotified) void sendStatusNotification(`⏳ Working${runTag}: ${summary}`);
       void sendStatusNotification(
         `🟡 In progress${runTag}: ${summary} (I’ll ping you here when it’s finished.)`
@@ -522,10 +660,12 @@ const server = http.createServer(async (req, res) => {
             if (w?.status === 'ok') {
               const text = await getLastAssistantText({ sinceMs: startedAt });
               const body = text ? `\n${text}` : '';
+              await recordRunUpdate({ runId, patch: { status: 'done', completedAtMs: Date.now() } });
               await sendStatusNotification(`✅ Done${runTag}: ${summary}${body}`);
               return;
             }
             if (w?.status && w.status !== 'timeout') {
+              await recordRunUpdate({ runId, patch: { status: String(w.status || 'unknown') } });
               await sendStatusNotification(`❌ Status (${w.status})${runTag}: ${summary}`);
               return;
             }
