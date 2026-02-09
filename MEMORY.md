@@ -16,5 +16,6 @@
 - EIN provided/recorded for WIMV: 41-4038055; IRS name control: WHER.
 
 ## System/integration notes
+- Current date context: treat **2026** as the current year (today is 2026-02-08 America/New_York); do not reference 2024 as “current year” in responses.
 - User asked to reduce voice assistant interruptions (increase listening / reduce cut-offs).
 - User wanted automatic Telegram notifications for task status changes (working/completed/changed); prior “retell tool” update requests showed timeouts.
