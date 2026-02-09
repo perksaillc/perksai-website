@@ -608,7 +608,12 @@ const server = http.createServer(async (req, res) => {
     // Retell tool calls should return quickly; long-running work can complete asynchronously.
     // Wait long enough that Retell can usually speak a real result, but cap to keep the voice UX snappy.
     // (Retell's own tool timeout is typically much higher; this cap is our server-side guardrail.)
-    const timeoutMs = Math.min(25_000, Math.max(1_000, Number(args.timeoutMs || 12_000)));
+    // Prefer waiting longer while a call is ongoing so the voice agent can usually report real results
+    // instead of “still processing…”. Off-call we keep it snappier.
+    const defaultTimeoutMs = callOngoing ? 45_000 : 12_000;
+    const maxTimeoutMs = callOngoing ? 90_000 : 30_000;
+    const requestedTimeoutMs = Number(args.timeoutMs || defaultTimeoutMs);
+    const timeoutMs = Math.min(maxTimeoutMs, Math.max(1_000, requestedTimeoutMs));
 
     const wait = await Promise.race([
       gw.client.request('agent.wait', { runId, timeoutMs }),
