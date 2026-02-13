@@ -68,3 +68,12 @@ A separate cron that monitors ALL jobs for errors/stalls, force-runs once with b
 ## Escalation rules
 - Telegram alert only if: repeated failure OR human action needed (auth/permissions/UI changed).
 - Outbound call only when explicitly requested AND blocked.
+
+## Reliability requirements (no silent failures)
+All automation (especially Google Docs / Retell UI work) must follow:
+- **state file** in `memory/` tracking step progress
+- **post-write verification** (read back what was written)
+- **retry + backoff** (2–3 attempts max per run)
+- **concise error alerts** that include failed step + what to do next
+
+Reference: `docs/cron-error-handling-standard.md`
