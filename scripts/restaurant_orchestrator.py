@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
 """Restaurant pipeline orchestrator.
 
-Runs restaurants in a fixed order, advancing each through steps.
-Currently implemented step:
-- scrape -> KB files -> Desktop copy
+Goal: keep the restaurant pipeline moving continuously.
 
-Future steps placeholders:
-- retell agent create/update
-- moveo pitch deck create/fill
+Behavior:
+- Runs ONE restaurant per invocation in a fixed round-robin order.
+- Each run executes the scrape pipeline (which generates KB files + copies to Desktop).
+- Does NOT permanently "complete" restaurants; it cycles forever.
 
 State file:
   /Users/gioalers/clawd/memory/restaurant-orchestrator-state.json
 
-Prints one-line JSON summary.
+Outputs a single-line JSON summary.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import time
 from pathlib import Path
@@ -40,8 +38,19 @@ def now_ms() -> int:
 
 def load_state() -> dict:
     if STATE_PATH.exists():
-        return json.loads(STATE_PATH.read_text())
-    return {"version": 1, "restaurants": {}, "lastRunAtMs": None, "lastError": None}
+        try:
+            st = json.loads(STATE_PATH.read_text())
+            if isinstance(st, dict):
+                return st
+        except Exception:
+            pass
+    return {
+        "version": 2,
+        "cursor": 0,
+        "restaurants": {},
+        "lastRunAtMs": None,
+        "lastError": None,
+    }
 
 
 def save_state(st: dict) -> None:
@@ -59,59 +68,78 @@ def run_scrape(slug: str) -> dict:
         "--config",
         str(cfg),
     ]
+
     p = subprocess.run(cmd, capture_output=True, text=True)
     out = (p.stdout or "").strip().splitlines()[-1] if p.stdout else ""
+
     try:
         j = json.loads(out) if out else {"ok": False, "error": "no output"}
     except Exception:
         j = {"ok": False, "error": f"bad json output: {out[:200]}"}
-    if p.returncode != 0 and j.get("ok") is True:
+
+    if p.returncode != 0:
         j["ok"] = False
         j["error"] = j.get("error") or (p.stderr or "unknown error").strip()[:200]
+
     if p.returncode != 0 and not j.get("error"):
         j["error"] = (p.stderr or "unknown error").strip()[:200]
+
     return j
 
 
 def main() -> int:
     st = load_state()
+    st.setdefault("version", 2)
+    st.setdefault("cursor", 0)
+    st.setdefault("restaurants", {})
+
     st["lastRunAtMs"] = now_ms()
 
-    # choose next restaurant not completed
-    for r in ORDER:
-        slug = r["slug"]
-        rs = st["restaurants"].get(slug, {"steps": {}, "completed": False})
-        if rs.get("completed"):
-            continue
+    if not ORDER:
+        print(json.dumps({"ok": False, "error": "ORDER is empty"}))
+        return 1
 
-        # Step: scrape
-        if not rs.get("steps", {}).get("scrape_ok"):
-            result = run_scrape(slug)
-            rs.setdefault("steps", {})
-            rs["steps"]["scrape_last"] = result
-            if result.get("ok"):
-                rs["steps"]["scrape_ok"] = True
-                rs["steps"]["kb_hash"] = result.get("hash")
-                rs["lastOkAtMs"] = now_ms()
-            else:
-                rs["lastErrorAtMs"] = now_ms()
-                rs["lastError"] = result.get("error")
-                st["restaurants"][slug] = rs
-                save_state(st)
-                print(json.dumps({"ok": False, "slug": slug, "step": "scrape", "error": result.get("error"), "result": result}))
-                return 1
+    cursor = int(st.get("cursor") or 0) % len(ORDER)
+    r = ORDER[cursor]
+    slug = r["slug"]
 
-        # For now, mark completed when scrape ok.
-        rs["completed"] = True
-        st["restaurants"][slug] = rs
-        save_state(st)
-        print(json.dumps({"ok": True, "slug": slug, "completed": True, "kb_hash": rs.get("steps", {}).get("kb_hash")}))
+    # advance cursor for next run (round-robin)
+    st["cursor"] = (cursor + 1) % len(ORDER)
+
+    rs = st["restaurants"].get(slug, {"steps": {}, "lastOkAtMs": None, "lastErrorAtMs": None})
+    rs.setdefault("steps", {})
+
+    result = run_scrape(slug)
+    rs["steps"]["scrape_last"] = result
+
+    if result.get("ok"):
+        rs["steps"]["scrape_ok"] = True
+        rs["steps"]["kb_hash"] = result.get("hash")
+        rs["lastOkAtMs"] = now_ms()
+        rs.pop("lastError", None)
+    else:
+        rs["lastErrorAtMs"] = now_ms()
+        rs["lastError"] = result.get("error")
+        st["lastError"] = result.get("error")
+
+    st["restaurants"][slug] = rs
+    save_state(st)
+
+    if result.get("ok"):
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "slug": slug,
+                    "kb_hash": rs.get("steps", {}).get("kb_hash"),
+                    "cursor": st.get("cursor"),
+                }
+            )
+        )
         return 0
 
-    # all complete
-    save_state(st)
-    print(json.dumps({"ok": True, "allCompleted": True}))
-    return 0
+    print(json.dumps({"ok": False, "slug": slug, "step": "scrape", "error": result.get("error"), "cursor": st.get("cursor"), "result": result}))
+    return 1
 
 
 if __name__ == "__main__":
