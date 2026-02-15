@@ -4,9 +4,14 @@
 Goal: keep the restaurant pipeline moving continuously.
 
 Behavior:
-- Runs ONE restaurant per invocation in a fixed round-robin order.
-- Each run executes the scrape pipeline (which generates KB files + copies to Desktop).
-- Does NOT permanently "complete" restaurants; it cycles forever.
+- Runs ALL restaurants in ORDER per invocation.
+- Each run executes the scrape pipeline (which generates KB files + copies to Desktop)
+  for every active restaurant.
+- Does NOT permanently "complete" restaurants; it runs forever.
+
+Why:
+- If this cron runs every 15 minutes, then each restaurant is refreshed every 15 minutes
+  (instead of round-robin where each restaurant would refresh every N*15 minutes).
 
 State file:
   /Users/gioalers/clawd/memory/restaurant-orchestrator-state.json
@@ -45,8 +50,7 @@ def load_state() -> dict:
         except Exception:
             pass
     return {
-        "version": 2,
-        "cursor": 0,
+        "version": 3,
         "restaurants": {},
         "lastRunAtMs": None,
         "lastError": None,
@@ -89,57 +93,55 @@ def run_scrape(slug: str) -> dict:
 
 def main() -> int:
     st = load_state()
-    st.setdefault("version", 2)
-    st.setdefault("cursor", 0)
+    st.setdefault("version", 3)
     st.setdefault("restaurants", {})
 
     st["lastRunAtMs"] = now_ms()
+    st["lastError"] = None
 
     if not ORDER:
         print(json.dumps({"ok": False, "error": "ORDER is empty"}))
         return 1
 
-    cursor = int(st.get("cursor") or 0) % len(ORDER)
-    r = ORDER[cursor]
-    slug = r["slug"]
+    refreshed = []
+    errors = []
 
-    # advance cursor for next run (round-robin)
-    st["cursor"] = (cursor + 1) % len(ORDER)
+    for r in ORDER:
+        slug = r["slug"]
+        rs = st["restaurants"].get(slug, {"steps": {}, "lastOkAtMs": None, "lastErrorAtMs": None})
+        rs.setdefault("steps", {})
 
-    rs = st["restaurants"].get(slug, {"steps": {}, "lastOkAtMs": None, "lastErrorAtMs": None})
-    rs.setdefault("steps", {})
+        result = run_scrape(slug)
+        rs["steps"]["scrape_last"] = result
 
-    result = run_scrape(slug)
-    rs["steps"]["scrape_last"] = result
+        if result.get("ok"):
+            rs["steps"]["scrape_ok"] = True
+            rs["steps"]["kb_hash"] = result.get("hash")
+            rs["lastOkAtMs"] = now_ms()
+            rs.pop("lastError", None)
+            refreshed.append({"slug": slug, "kb_hash": result.get("hash")})
+        else:
+            rs["lastErrorAtMs"] = now_ms()
+            rs["lastError"] = result.get("error")
+            st["lastError"] = result.get("error")
+            errors.append({"slug": slug, "step": "scrape", "error": result.get("error")})
 
-    if result.get("ok"):
-        rs["steps"]["scrape_ok"] = True
-        rs["steps"]["kb_hash"] = result.get("hash")
-        rs["lastOkAtMs"] = now_ms()
-        rs.pop("lastError", None)
-    else:
-        rs["lastErrorAtMs"] = now_ms()
-        rs["lastError"] = result.get("error")
-        st["lastError"] = result.get("error")
+        st["restaurants"][slug] = rs
 
-    st["restaurants"][slug] = rs
     save_state(st)
 
-    if result.get("ok"):
-        print(
-            json.dumps(
-                {
-                    "ok": True,
-                    "slug": slug,
-                    "kb_hash": rs.get("steps", {}).get("kb_hash"),
-                    "cursor": st.get("cursor"),
-                }
-            )
+    ok = len(errors) == 0
+    print(
+        json.dumps(
+            {
+                "ok": ok,
+                "refreshed": refreshed,
+                "errors": errors,
+            }
         )
-        return 0
+    )
 
-    print(json.dumps({"ok": False, "slug": slug, "step": "scrape", "error": result.get("error"), "cursor": st.get("cursor"), "result": result}))
-    return 1
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
