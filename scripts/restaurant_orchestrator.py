@@ -26,22 +26,47 @@ import subprocess
 import time
 from pathlib import Path
 
-ORDER = [
-    {"slug": "sushi_hana_valrico", "name": "Sushi Hana", "city": "Valrico"},
-    {"slug": "sushi_ushi_valrico", "name": "Sushi Ushi", "city": "Valrico"},
-    {"slug": "kanji_sushi_ramen_brandon", "name": "Kanji Sushi & Ramen", "city": "Brandon"},
-    {"slug": "robongi_valrico", "name": "Robongi Sushi Wok&Grill", "city": "Valrico"},
-    {"slug": "sticky_rice_sushi_riverview", "name": "Sticky Rice Sushi", "city": "Riverview"},
-
-    # New batch
-    {"slug": "bubbaques_bbq_brandon", "name": "BubbaQue's BBQ", "city": "Brandon"},
-    {"slug": "moreno_bakery_brandon", "name": "Moreno Bakery", "city": "Brandon"},
-    {"slug": "mission_bbq_brandon", "name": "MISSION BBQ", "city": "Brandon"},
-    {"slug": "shrimp_boat_grill_valrico", "name": "Shrimp Boat Grill", "city": "Valrico"},
-    {"slug": "freds_market_plant_city", "name": "Fred's Market Restaurant", "city": "Plant City"},
-]
-
+WORKFLOW_PATH = Path("/Users/gioalers/clawd/memory/restaurant-workflow-state.json")
 STATE_PATH = Path("/Users/gioalers/clawd/memory/restaurant-orchestrator-state.json")
+
+
+def load_workflow() -> dict:
+    if WORKFLOW_PATH.exists():
+        try:
+            wf = json.loads(WORKFLOW_PATH.read_text())
+            if isinstance(wf, dict):
+                return wf
+        except Exception:
+            pass
+    return {"activeOrder": [], "restaurants": {}}
+
+
+def compute_order() -> list[dict]:
+    """Compute the active ORDER from restaurant-workflow-state.json.
+
+    Filters:
+    - Exclude restaurants marked status=complete or status=skipped.
+    - Keep the remaining in activeOrder sequence.
+
+    Returns: list of dicts with at least {slug}.
+    """
+    wf = load_workflow()
+    active = wf.get("activeOrder") or []
+    restaurants = wf.get("restaurants") or {}
+
+    order: list[dict] = []
+    for slug in active:
+        r = restaurants.get(slug, {})
+        status = (r.get("status") or "").lower()
+        step = (r.get("step") or "").lower()
+        if status in {"complete", "skipped"} or step in {"done", "skipped"}:
+            continue
+        order.append({
+            "slug": slug,
+            "name": r.get("displayName"),
+            "location": r.get("location"),
+        })
+    return order
 
 
 def now_ms() -> int:
@@ -71,6 +96,9 @@ def save_state(st: dict) -> None:
 
 def run_scrape(slug: str) -> dict:
     cfg = Path(f"/Users/gioalers/clawd/tmp/retail_agents/{slug}/restaurant_profile.json")
+    if not cfg.exists():
+        return {"ok": True, "skipped": True, "reason": f"missing config: {cfg}"}
+
     cmd = [
         "python3",
         "/Users/gioalers/clawd/scripts/restaurant_scrape_generic.py",
@@ -106,11 +134,14 @@ def main() -> int:
     st["lastRunAtMs"] = now_ms()
     st["lastError"] = None
 
+    ORDER = compute_order()
+
     if not ORDER:
-        print(json.dumps({"ok": False, "error": "ORDER is empty"}))
+        print(json.dumps({"ok": False, "error": "No active restaurants to run (all complete/skipped or activeOrder empty)"}))
         return 1
 
     refreshed = []
+    skipped = []
     errors = []
 
     for r in ORDER:
@@ -121,7 +152,10 @@ def main() -> int:
         result = run_scrape(slug)
         rs["steps"]["scrape_last"] = result
 
-        if result.get("ok"):
+        if result.get("ok") and result.get("skipped"):
+            # Not an error: just not configured yet.
+            skipped.append({"slug": slug, "reason": result.get("reason")})
+        elif result.get("ok"):
             rs["steps"]["scrape_ok"] = True
             rs["steps"]["kb_hash"] = result.get("hash")
             rs["lastOkAtMs"] = now_ms()
@@ -143,6 +177,7 @@ def main() -> int:
             {
                 "ok": ok,
                 "refreshed": refreshed,
+                "skipped": skipped,
                 "errors": errors,
             }
         )

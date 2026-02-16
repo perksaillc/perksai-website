@@ -78,9 +78,11 @@ def _safe_text(html: str) -> str:
 
 
 def fetch(url: str, timeout: int = 25) -> str:
+    # Prefer a mobile-ish UA; several restaurant sites block generic desktop scraping.
     headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
         "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
     req = urllib.request.Request(url, headers=headers)
     try:
@@ -167,23 +169,34 @@ def main() -> int:
 
         sources = []
         text_blobs = []
+        fetch_errors: list[str] = []
+
+        def safe_fetch(u: str) -> str | None:
+            try:
+                return fetch(u)
+            except Exception as e:
+                fetch_errors.append(f"{u} :: {type(e).__name__}: {e}")
+                return None
 
         if website:
-            html = fetch(website)
-            sources.append(website)
-            text_blobs.append(_safe_text(html))
+            html = safe_fetch(website)
+            if html:
+                sources.append(website)
+                text_blobs.append(_safe_text(html))
 
         if menu_url and menu_url != website:
-            html = fetch(menu_url)
-            sources.append(menu_url)
-            text_blobs.append(_safe_text(html))
+            html = safe_fetch(menu_url)
+            if html:
+                sources.append(menu_url)
+                text_blobs.append(_safe_text(html))
 
         menu_price_lines = []
         if order_url:
-            html = fetch(order_url)
-            sources.append(order_url)
-            text_blobs.append(_safe_text(html))
-            menu_price_lines = extract_menu_price_lines(text_blobs[-1], limit=140)
+            html = safe_fetch(order_url)
+            if html:
+                sources.append(order_url)
+                text_blobs.append(_safe_text(html))
+                menu_price_lines = extract_menu_price_lines(text_blobs[-1], limit=140)
 
         joined = "\n\n".join(text_blobs)
 
@@ -236,6 +249,14 @@ def main() -> int:
                 md.append(f"- {ln}")
             md.append("")
 
+        if fetch_errors:
+            md.append("## Fetch notes")
+            md.append("Some sources blocked automated fetch (this is normal). The assistant should rely on provided contact info and confirm details with the restaurant when unsure.")
+            md.append("")
+            for fe in fetch_errors[:20]:
+                md.append(f"- {fe}")
+            md.append("")
+
         md.append("## Sources")
         for s in sources:
             md.append(f"- {s}")
@@ -267,6 +288,7 @@ def main() -> int:
                     "address": address,
                     "phone": phone,
                     "hours": hours,
+                    "fetchErrors": fetch_errors,
                 }
             )
         )
