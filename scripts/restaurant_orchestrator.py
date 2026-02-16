@@ -32,6 +32,13 @@ ORDER = [
     {"slug": "kanji_sushi_ramen_brandon", "name": "Kanji Sushi & Ramen", "city": "Brandon"},
     {"slug": "robongi_valrico", "name": "Robongi Sushi Wok&Grill", "city": "Valrico"},
     {"slug": "sticky_rice_sushi_riverview", "name": "Sticky Rice Sushi", "city": "Riverview"},
+
+    # New batch
+    {"slug": "bubbaques_bbq_brandon", "name": "BubbaQue's BBQ", "city": "Brandon"},
+    {"slug": "moreno_bakery_brandon", "name": "Moreno Bakery", "city": "Brandon"},
+    {"slug": "mission_bbq_brandon", "name": "MISSION BBQ", "city": "Brandon"},
+    {"slug": "shrimp_boat_grill_valrico", "name": "Shrimp Boat Grill", "city": "Valrico"},
+    {"slug": "freds_market_plant_city", "name": "Fred's Market Restaurant", "city": "Plant City"},
 ]
 
 STATE_PATH = Path("/Users/gioalers/clawd/memory/restaurant-orchestrator-state.json")
