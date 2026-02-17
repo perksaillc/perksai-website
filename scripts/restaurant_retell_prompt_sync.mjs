@@ -123,11 +123,15 @@ function renderPrompt({ name, address, phone, website, menuUrl, orderUrl, hours 
   lines.push('- If something isn’t in the KB, say you don’t have it in front of you and offer the **phone number** (and ordering link if available).');
   lines.push('');
 
-  lines.push('## Ordering & payments');
-  lines.push('- You do **not** take payment or finalize orders.');
-  lines.push('- If the guest wants to place an order: say “Ordering through chat is coming soon.”');
-  if (orderUrl) lines.push(`- Then provide: **${orderUrl}**`);
-  if (phone) lines.push(`- And provide: **${phone}**`);
+  lines.push('## Ordering (guided order-taking) & payments');
+  lines.push('- You **can** help a guest place an order by taking a **guided pickup order**.');
+  lines.push('- You do **not** take payment or finalize orders inside the assistant.');
+  lines.push('- Do **not** refuse. Do **not** say “ordering is coming soon.”');
+  lines.push('- Ask concise questions, one at a time. Default to **pickup** unless they ask for delivery.');
+  lines.push('- Collect: **name**, **callback number**, **pickup time** (ASAP or a specific time), **items + quantity + modifications**, and any **allergies**.');
+  lines.push('- Then **recap** the full order clearly and confirm.');
+  if (orderUrl) lines.push(`- To complete payment, direct them to the official online ordering link: **${orderUrl}**`);
+  if (phone) lines.push(`- If they can’t order online, offer to connect them to staff / have them call: **${phone}**`);
   lines.push('- Never request or store card numbers.');
   lines.push('');
 
@@ -248,7 +252,12 @@ async function main() {
       hours: profile?.hours || null,
     });
 
-    const needsUpdate = currentPrompt.length < 200 || !currentPrompt.includes(CURRENT_TIME_VAR) || currentPrompt.includes('Type in a universal prompt');
+    const needsUpdate =
+      currentPrompt.length < 200 ||
+      !currentPrompt.includes(CURRENT_TIME_VAR) ||
+      currentPrompt.includes('Type in a universal prompt') ||
+      /ordering through chat is coming soon/i.test(currentPrompt) ||
+      !/guided pickup order/i.test(currentPrompt);
 
     if (args.dryRun) {
       results.push({ slug, agentId, llmId, needsUpdate, currentPromptChars: currentPrompt.length, nextPromptChars: prompt.length });
